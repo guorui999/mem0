@@ -12,6 +12,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from mem0.exceptions import ValidationError as Mem0ValidationError
+
 pytest.importorskip("fastapi", reason="fastapi not installed")
 
 from fastapi.testclient import TestClient
@@ -106,6 +108,32 @@ class TestSearchThreshold:
         assert resp.status_code == 200
         _, kwargs = mock_memory.search.call_args
         assert "threshold" not in kwargs
+
+
+# ===========================================================================
+# SearchRequest: explain parameter
+# ===========================================================================
+
+class TestSearchExplain:
+    """Verify that the explain parameter is accepted and forwarded."""
+
+    def test_explain_true_forwarded(self, client, mock_memory):
+        resp = client.post("/search", json={"query": "food", "user_id": "u1", "explain": True})
+        assert resp.status_code == 200
+        _, kwargs = mock_memory.search.call_args
+        assert kwargs["explain"] is True
+
+    def test_explain_false_forwarded(self, client, mock_memory):
+        resp = client.post("/search", json={"query": "food", "user_id": "u1", "explain": False})
+        assert resp.status_code == 200
+        _, kwargs = mock_memory.search.call_args
+        assert kwargs["explain"] is False
+
+    def test_explain_omitted_uses_memory_default(self, client, mock_memory):
+        resp = client.post("/search", json={"query": "food", "user_id": "u1"})
+        assert resp.status_code == 200
+        _, kwargs = mock_memory.search.call_args
+        assert "explain" not in kwargs
 
 
 # ===========================================================================
@@ -656,3 +684,63 @@ class TestSearchEntityIdMapping:
         _, kwargs = mock_memory.search.call_args
         assert kwargs["filters"]["user_id"] == "u1"
         assert kwargs["filters"]["category"] == "food"
+
+
+class TestSearchValidationErrors:
+    """Verify that ValueError from Memory.search() returns 400, not 502."""
+
+    def test_empty_filters_returns_400(self, client, mock_memory):
+        mock_memory.search.side_effect = ValueError(
+            "filters must contain at least one of: user_id, agent_id, run_id"
+        )
+        resp = client.post("/search", json={"query": "food", "filters": {}})
+        assert resp.status_code == 400
+        assert "filters must contain" in resp.json()["detail"]
+
+    def test_no_identifiers_returns_400(self, client, mock_memory):
+        mock_memory.search.side_effect = ValueError(
+            "filters must contain at least one of: user_id, agent_id, run_id"
+        )
+        resp = client.post("/search", json={"query": "food"})
+        assert resp.status_code == 400
+
+
+# ===========================================================================
+# add / update / delete: map core errors to 4xx instead of 502
+# ===========================================================================
+
+class TestWriteHandlerErrorMapping:
+    """ValueError("... not found") -> 404, other ValueError / Mem0ValidationError
+    -> 400. A real outage still surfaces as 502 via upstream_error()."""
+
+    def test_update_not_found_returns_404(self, client, mock_memory):
+        mock_memory.update.side_effect = ValueError("Memory with id mem-1 not found")
+        resp = client.put("/memories/mem-1", json={"text": "new"})
+        assert resp.status_code == 404
+        assert "not found" in resp.json()["detail"]
+
+    def test_delete_not_found_returns_404(self, client, mock_memory):
+        mock_memory.delete.side_effect = ValueError("Memory with id mem-1 not found")
+        resp = client.delete("/memories/mem-1")
+        assert resp.status_code == 404
+
+    def test_update_other_value_error_returns_400(self, client, mock_memory):
+        mock_memory.update.side_effect = ValueError("data must be a non-empty string")
+        resp = client.put("/memories/mem-1", json={"text": "new"})
+        assert resp.status_code == 400
+
+    def test_add_validation_error_returns_400(self, client, mock_memory):
+        mock_memory.add.side_effect = Mem0ValidationError(
+            message="messages must be str, dict, or list[dict]", error_code="VALIDATION_003"
+        )
+        resp = client.post("/memories", json={
+            "messages": [{"role": "user", "content": "hi"}], "user_id": "u1",
+        })
+        assert resp.status_code == 400
+
+    def test_add_real_outage_still_returns_502(self, client, mock_memory):
+        mock_memory.add.side_effect = RuntimeError("vector store unreachable")
+        resp = client.post("/memories", json={
+            "messages": [{"role": "user", "content": "hi"}], "user_id": "u1",
+        })
+        assert resp.status_code == 502
